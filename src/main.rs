@@ -19,6 +19,7 @@ mod spotify;
 mod deemix;
 mod users;
 mod voice;
+mod youtube;
 
 use users::{UsersDb, UserSettings};
 
@@ -92,6 +93,7 @@ pub struct BotState {
     pub users: UsersDb,
     pub pending_voices: Arc<Mutex<HashMap<String, String>>>, // short_id -> file_id
     pub current_bitrate: Arc<Mutex<u8>>, // runtime-changeable bitrate
+    pub current_arl: Arc<Mutex<String>>, // updated via /updatearl, used for auto re-login
 }
 
 impl BotState {
@@ -101,12 +103,14 @@ impl BotState {
             .build()
             .expect("Failed to build HTTP client");
         let default_bitrate = config.deemix_bitrate;
+        let default_arl = config.deemix_arl.clone();
         Self {
             config: Arc::new(config),
             http,
             users,
             pending_voices: Arc::new(Mutex::new(HashMap::new())),
             current_bitrate: Arc::new(Mutex::new(default_bitrate)),
+            current_arl: Arc::new(Mutex::new(default_arl)),
         }
     }
 }
@@ -254,6 +258,10 @@ fn settings_keyboard(s: &UserSettings, config: &Config, bitrate: u8) -> Keyboard
     .resize_keyboard(true)
 }
 
+fn arl_cancel_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("❌ Cancel", "cancel_arl")]])
+}
+
 fn main_keyboard(s: &UserSettings, config: &Config) -> KeyboardMarkup {
     let mut rows = vec![
         vec![
@@ -323,6 +331,7 @@ I connect to your personal deemix server and queue music downloads for you. Just
 • Type any song or artist name → search and pick from results\n\
 • Send a Deezer link (track, album, playlist) → queued instantly\n\
 • Send a Spotify, YouTube, YouTube Music, or Apple Music link → found on Deezer and queued\n\
+• Send a Spotify or YouTube playlist link → every track is scanned and queued individually\n\
 • Send a voice note → transcribe what you said or recognize the song\n\n\
 🔧 All commands:\n\
 /menu — quick action buttons\n\
@@ -349,8 +358,9 @@ I connect to your personal deemix server and queue music downloads for you. Just
                     let mut text = "✅ Deemix is reachable\n".to_string();
                     if q.downloading > 0 { text.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { text.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
+                    if q.failed > 0 { text.push_str(&format!("❌ Failed: {}\n", q.failed)); }
                     if q.done > 0 { text.push_str(&format!("✅ Completed (in queue): {}", q.done)); }
-                    if q.downloading == 0 && q.pending == 0 && q.done == 0 { text.push_str("📭 Queue is empty"); }
+                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { text.push_str("📭 Queue is empty"); }
                     bot.send_message(msg.chat.id, text).await?;
                 }
                 Err(e) => { bot.send_message(msg.chat.id, format!("❌ Can't reach deemix: {}", e)).await?; }
@@ -403,7 +413,9 @@ I connect to your personal deemix server and queue music downloads for you. Just
         Command::Updatearl => {
             dialogue.update(State::AwaitingArl).await
                 .map_err(|e| teloxide::RequestError::Api(teloxide::ApiError::Unknown(e.to_string())))?;
-            bot.send_message(msg.chat.id, "Please send your new Deezer ARL:").await?;
+            bot.send_message(msg.chat.id, "Please send your new Deezer ARL:")
+                .reply_markup(arl_cancel_keyboard())
+                .await?;
         }
     }
 
@@ -443,7 +455,9 @@ async fn receive_arl(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyD
     };
 
     if arl.len() < 100 {
-        bot.send_message(msg.chat.id, "❌ That ARL looks too short, double check it. Try again:").await?;
+        bot.send_message(msg.chat.id, "❌ That ARL looks too short, double check it. Try again:")
+            .reply_markup(arl_cancel_keyboard())
+            .await?;
         return Ok(());
     }
 
@@ -485,13 +499,9 @@ async fn receive_voice_transcribe(bot: Bot, msg: Message, state: Arc<BotState>, 
             match deemix::search(&state, &text, "track").await {
                 Ok(results) if results.is_empty() => { bot.edit_message_text(msg.chat.id, sent2.id, format!("😕 No results for: {}", text)).await?; }
                 Ok(results) => {
-                    let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                        let label = format!("🎵 {} — {}", item["title"].as_str().unwrap_or("?"), item["artist"]["name"].as_str().unwrap_or("?"));
-                        let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                        vec![InlineKeyboardButton::callback(label, format!("dl:{}", item["link"].as_str().unwrap_or("")))]
-                    }).collect();
+                    let (listing, mut buttons) = build_search_results(&results, "🎵");
                     buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-                    bot.edit_message_text(msg.chat.id, sent2.id, format!("Results for {}:", text))
+                    bot.edit_message_text(msg.chat.id, sent2.id, format!("Results for {}:\n\n{}\nTap a button to download.", text, listing))
                         .reply_markup(InlineKeyboardMarkup::new(buttons)).await?;
                 }
                 Err(e) => { bot.edit_message_text(msg.chat.id, sent2.id, format!("❌ Search failed: {}", e)).await?; }
@@ -623,16 +633,12 @@ async fn receive_voice_recognize(bot: Bot, msg: Message, state: Arc<BotState>, d
                         }
                     } else {
                         log::info!("[recognize] Step 3: got {} Deezer results", results.len());
-                        let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                            let label = format!("🎵 {} — {}", item["title"].as_str().unwrap_or("?"), item["artist"]["name"].as_str().unwrap_or("?"));
-                            let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                            vec![InlineKeyboardButton::callback(label, format!("dl:{}", item["link"].as_str().unwrap_or("")))]
-                        }).collect();
+                        let (listing, mut buttons) = build_search_results(&results, "🎵");
                         if let Ok(url) = reqwest::Url::parse(&deezer_search_url) {
                             buttons.push(vec![InlineKeyboardButton::url("🔍 None of these — search on Deezer", url)]);
                         }
                         buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-                        bot.edit_message_text(msg.chat.id, sent2.id, format!("Results for {} — {}:\n\nIf none match, search on Deezer and paste the link back here.", rec.title, rec.artist))
+                        bot.edit_message_text(msg.chat.id, sent2.id, format!("Results for {} — {}:\n\n{}\nIf none match, search on Deezer and paste the link back here.", rec.title, rec.artist, listing))
                             .reply_markup(InlineKeyboardMarkup::new(buttons)).await?;
                     }
                     } // closes 2c else
@@ -768,8 +774,9 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
                     let mut t = "✅ Deemix is reachable\n".to_string();
                     if q.downloading > 0 { t.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { t.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
+                    if q.failed > 0 { t.push_str(&format!("❌ Failed: {}\n", q.failed)); }
                     if q.done > 0 { t.push_str(&format!("✅ Completed: {}", q.done)); }
-                    if q.downloading == 0 && q.pending == 0 && q.done == 0 { t.push_str("📭 Queue is empty"); }
+                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { t.push_str("📭 Queue is empty"); }
                     bot.send_message(msg.chat.id, t).await?;
                 }
                 Err(e) => { bot.send_message(msg.chat.id, format!("❌ Can't reach deemix: {}", e)).await?; }
@@ -797,7 +804,9 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
         }
         "🔑 Update ARL" => {
             dialogue.update(State::AwaitingArl).await.ok();
-            bot.send_message(msg.chat.id, "Please send your new Deezer ARL:").await?;
+            bot.send_message(msg.chat.id, "Please send your new Deezer ARL:")
+                .reply_markup(arl_cancel_keyboard())
+                .await?;
             return Ok(());
         }
         "ℹ️ Help" => {
@@ -809,6 +818,7 @@ I connect to your personal deemix server and queue music downloads. Just tell me
 • Type any song or artist name → search and pick\n\
 • Send a Deezer link → queued instantly\n\
 • Send a Spotify, YouTube, YouTube Music, or Apple Music link → found on Deezer and queued\n\
+• Send a Spotify or YouTube playlist link → every track is scanned and queued individually\n\
 • Send a voice note → transcribe or recognize\n\n\
 🔧 Commands:\n\
 /menu — quick action buttons\n\
@@ -938,7 +948,12 @@ I connect to your personal deemix server and queue music downloads. Just tell me
 
 // ── Callback Handler ──────────────────────────────────────────────────────────
 
-async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> ResponseResult<()> {
+async fn handle_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    state: Arc<BotState>,
+    storage: Arc<InMemStorage<State>>,
+) -> ResponseResult<()> {
     bot.answer_callback_query(&q.id).await?;
 
     let data = match &q.data {
@@ -949,6 +964,15 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
     if data == "cancel" {
         if let Some(msg) = &q.message {
             bot.edit_message_text(msg.chat.id, msg.id, "Cancelled.").await?;
+        }
+        return Ok(());
+    }
+
+    if data == "cancel_arl" {
+        if let Some(msg) = &q.message {
+            let dialogue: MyDialogue = Dialogue::new(storage, msg.chat.id);
+            dialogue.exit().await.ok();
+            bot.edit_message_text(msg.chat.id, msg.id, "❌ ARL update cancelled.").await?;
         }
         return Ok(());
     }
@@ -1017,13 +1041,9 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
                                     bot.edit_message_text(msg.chat.id, sent.id, format!("😕 No results for: {}", text)).await?;
                                 }
                                 Ok(results) => {
-                                    let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                                        let label = format!("🎵 {} — {}", item["title"].as_str().unwrap_or("?"), item["artist"]["name"].as_str().unwrap_or("?"));
-                                        let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                                        vec![InlineKeyboardButton::callback(label, format!("dl:{}", item["link"].as_str().unwrap_or("")))]
-                                    }).collect();
+                                    let (listing, mut buttons) = build_search_results(&results, "🎵");
                                     buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-                                    bot.edit_message_text(msg.chat.id, sent.id, format!("Results for '{}':", text))
+                                    bot.edit_message_text(msg.chat.id, sent.id, format!("Results for '{}':\n\n{}\nTap a button to download.", text, listing))
                                         .reply_markup(InlineKeyboardMarkup::new(buttons)).await?;
                                 }
                                 Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Search failed: {}", e)).await?; }
@@ -1133,16 +1153,12 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
                                         }
                                     } else {
                                         log::info!("[recognize/cb] Step 3: got {} Deezer results", results.len());
-                                        let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                                            let label = format!("🎵 {} — {}", item["title"].as_str().unwrap_or("?"), item["artist"]["name"].as_str().unwrap_or("?"));
-                                            let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                                            vec![InlineKeyboardButton::callback(label, format!("dl:{}", item["link"].as_str().unwrap_or("")))]
-                                        }).collect();
+                                        let (listing, mut buttons) = build_search_results(&results, "🎵");
                                         if let Ok(url) = reqwest::Url::parse(&deezer_search_url) {
                                             buttons.push(vec![InlineKeyboardButton::url("🔍 None of these — search on Deezer", url)]);
                                         }
                                         buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-                                        bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {} — {}:\n\nIf none match, search on Deezer and paste the link back here.", rec.title, rec.artist))
+                                        bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {} — {}:\n\n{}\nIf none match, search on Deezer and paste the link back here.", rec.title, rec.artist, listing))
                                             .reply_markup(InlineKeyboardMarkup::new(buttons)).await?;
                                     }
                                     } // closes 2c else
@@ -1186,24 +1202,32 @@ async fn queue_url(bot: &Bot, msg: &Message, state: &Arc<BotState>, url: &str) -
     Ok(())
 }
 
+/// Telegram truncates long button labels, so the message text carries the full
+/// numbered track list and the buttons reference the numbers.
+fn build_search_results(results: &[serde_json::Value], icon: &str) -> (String, Vec<Vec<InlineKeyboardButton>>) {
+    let mut listing = String::new();
+    let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    for (i, item) in results.iter().enumerate() {
+        let title = item["title"].as_str().unwrap_or("?");
+        let artist = item["artist"]["name"].as_str().unwrap_or("?");
+        listing.push_str(&format!("{}. {} — {}\n", i + 1, title, artist));
+        let label = format!("{} {}. {} — {}", icon, i + 1, title, artist);
+        let label = if label.chars().count() > 60 { format!("{}…", label.chars().take(59).collect::<String>()) } else { label };
+        buttons.push(vec![InlineKeyboardButton::callback(label, format!("dl:{}", item["link"].as_str().unwrap_or("")))]);
+    }
+    (listing, buttons)
+}
+
 async fn do_search(bot: &Bot, msg: &Message, state: &Arc<BotState>, query: &str, search_type: &str) -> ResponseResult<()> {
     let sent = bot.send_message(msg.chat.id, format!("🔍 Searching for {}...", query)).await?;
 
     match deemix::search(state, query, search_type).await {
         Ok(results) if results.is_empty() => { bot.edit_message_text(msg.chat.id, sent.id, "😕 No results found.").await?; }
         Ok(results) => {
-            let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                let label = format!("{} {} — {}",
-                    if search_type == "track" { "🎵" } else { "💿" },
-                    item["title"].as_str().unwrap_or("?"),
-                    item["artist"]["name"].as_str().unwrap_or("?")
-                );
-                let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                let url = item["link"].as_str().unwrap_or("").to_string();
-                vec![InlineKeyboardButton::callback(label, format!("dl:{}", url))]
-            }).collect();
+            let icon = if search_type == "track" { "🎵" } else { "💿" };
+            let (listing, mut buttons) = build_search_results(&results, icon);
             buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-            bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {}:", query))
+            bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {}:\n\n{}\nTap a button to download.", query, listing))
                 .reply_markup(InlineKeyboardMarkup::new(buttons))
                 .await?;
         }
@@ -1235,14 +1259,10 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
                         }
                     }
                     Ok(results) => {
-                        let mut buttons: Vec<Vec<InlineKeyboardButton>> = results.iter().map(|item| {
-                            let label = format!("🎵 {} — {}", item["title"].as_str().unwrap_or("?"), item["artist"]["name"].as_str().unwrap_or("?"));
-                            let label = if label.chars().count() > 60 { format!("{}...", label.chars().take(57).collect::<String>()) } else { label };
-                            let url = item["link"].as_str().unwrap_or("").to_string();
-                            vec![InlineKeyboardButton::callback(label, format!("dl:{}", url))]
-                        }).collect();
+                        let icon = if search_type == "track" { "🎵" } else { "💿" };
+                        let (listing, mut buttons) = build_search_results(&results, icon);
                         buttons.push(vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")]);
-                        bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {}:", meta.query))
+                        bot.edit_message_text(msg.chat.id, sent.id, format!("Results for {}:\n\n{}\nTap a button to download.", meta.query, listing))
                             .reply_markup(InlineKeyboardMarkup::new(buttons))
                             .await?;
                     }
@@ -1254,13 +1274,45 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
         return Ok(());
     }
 
-    // Spotify playlist, YouTube, Apple Music: convert via Odesli to a Deezer URL and queue directly
-    let service = if SPOTIFY_PLAYLIST_RE.is_match(url) {
-        let name = spotify::resolve(url).await
-            .map(|m| m.label)
-            .unwrap_or_else(|| "Spotify playlist".to_string());
-        format!("playlist \"{}\"", name)
-    } else if YOUTUBE_RE.is_match(url) {
+    // Spotify playlist: scan the track list and queue each song individually,
+    // so user-generated playlists work (Deezer rarely has a same-named playlist)
+    if SPOTIFY_PLAYLIST_RE.is_match(url) {
+        bot.edit_message_text(msg.chat.id, sent.id, "🔍 Reading Spotify playlist...").await?;
+        match spotify::resolve_playlist(url).await {
+            Some(pl) => { queue_playlist(bot, msg, state, sent.id, &pl).await?; }
+            None => {
+                bot.edit_message_text(msg.chat.id, sent.id,
+                    "😕 Couldn't read that Spotify playlist. Make sure it's public and try again.").await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // YouTube playlist: same per-track treatment
+    let mut url = url.to_string();
+    if YOUTUBE_RE.is_match(&url) && youtube::playlist_id(&url).is_some() {
+        bot.edit_message_text(msg.chat.id, sent.id, "🔍 Reading YouTube playlist...").await?;
+        match youtube::resolve_playlist(&state.http, &url).await {
+            Some(pl) => {
+                queue_playlist(bot, msg, state, sent.id, &pl).await?;
+                return Ok(());
+            }
+            None => {
+                if url.contains("watch?v=") || url.contains("youtu.be/") {
+                    // Mixes and private lists can't be scanned — fall back to the single video
+                    url = youtube::strip_playlist_params(&url);
+                } else {
+                    bot.edit_message_text(msg.chat.id, sent.id,
+                        "😕 Couldn't read that YouTube playlist. Make sure it's public and try again.").await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let url = url.as_str();
+
+    // Single YouTube video / Apple Music: convert via Odesli to a Deezer URL and queue directly
+    let service = if YOUTUBE_RE.is_match(url) {
         "YouTube link".to_string()
     } else {
         "Apple Music link".to_string()
@@ -1284,11 +1336,84 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
     Ok(())
 }
 
+fn first_link(results: &[serde_json::Value]) -> Option<String> {
+    results.first().and_then(|x| x["link"].as_str()).map(|s| s.to_string())
+}
+
+/// Queue every track of a scanned playlist by searching it on Deezer and
+/// queuing the first match. Edits the status message with progress and a
+/// final summary of anything that couldn't be found.
+async fn queue_playlist(
+    bot: &Bot,
+    msg: &Message,
+    state: &Arc<BotState>,
+    status_id: teloxide::types::MessageId,
+    pl: &spotify::Playlist,
+) -> ResponseResult<()> {
+    let total = pl.tracks.len();
+    let mut queued = 0usize;
+    let mut not_found: Vec<String> = Vec::new();
+
+    for (i, track) in pl.tracks.iter().enumerate() {
+        if i % 5 == 0 {
+            let _ = bot.edit_message_text(msg.chat.id, status_id,
+                format!("⏳ Queuing \"{}\" — {}/{} tracks...", pl.name, i, total)).await;
+        }
+
+        let full_query = if track.artist.is_empty() {
+            track.title.clone()
+        } else {
+            format!("{} {}", track.title, track.artist)
+        };
+        let mut link = deemix::search(state, &full_query, "track").await.ok()
+            .and_then(|r| first_link(&r));
+        if link.is_none() && !track.artist.is_empty() {
+            link = deemix::search(state, &track.title, "track").await.ok()
+                .and_then(|r| first_link(&r));
+        }
+
+        let label = if track.artist.is_empty() {
+            track.title.clone()
+        } else {
+            format!("{} — {}", track.title, track.artist)
+        };
+        match link {
+            Some(l) => match deemix::add_to_queue(state, &l).await {
+                Ok(_) => queued += 1,
+                Err(e) => {
+                    log::warn!("[playlist] failed to queue {:?}: {}", label, e);
+                    not_found.push(label);
+                }
+            },
+            None => not_found.push(label),
+        }
+    }
+
+    let mut text = format!("✅ Playlist \"{}\": queued {}/{} tracks.", pl.name, queued, total);
+    if !not_found.is_empty() {
+        text.push_str("\n\n😕 Couldn't queue these:\n");
+        for t in not_found.iter().take(15) {
+            let t = if t.chars().count() > 80 {
+                format!("{}…", t.chars().take(79).collect::<String>())
+            } else {
+                t.clone()
+            };
+            text.push_str(&format!("• {}\n", t));
+        }
+        if not_found.len() > 15 {
+            text.push_str(&format!("…and {} more", not_found.len() - 15));
+        }
+    }
+    bot.edit_message_text(msg.chat.id, status_id, text).await?;
+    Ok(())
+}
+
 async fn handle_updatearl(bot: &Bot, msg: &Message, state: &Arc<BotState>, arl: &str) -> ResponseResult<()> {
     let sent = bot.send_message(msg.chat.id, "🔄 Validating new ARL...").await?;
 
     match deemix::login_arl(state, arl).await {
         Ok(_username) => {
+            *state.current_arl.lock().await = arl.to_string();
             bot.edit_message_text(msg.chat.id, sent.id, format!("✅ Logged in!\n🔄 Updating .env file...")).await?;
 
             match std::fs::read_to_string(&state.config.env_file) {

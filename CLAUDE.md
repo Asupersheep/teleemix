@@ -35,7 +35,8 @@ Teleemix is a Telegram bot that lets users request music downloads from a self-h
 |---|---|
 | `src/main.rs` | Bot entry point, dialogue state machine, command handlers, keyboard UI, `Config`/`BotState` structs |
 | `src/deemix.rs` | deemix API client: login with ARL, queue downloads, search, poll queue status |
-| `src/spotify.rs` | Spotify link resolver via embed page scraping — no API key required |
+| `src/spotify.rs` | Spotify track/album/playlist resolver via embed page scraping — no API key required |
+| `src/youtube.rs` | YouTube playlist scanner via `ytInitialData` scraping — no API key required |
 | `src/users.rs` | Per-user settings persistence backed by `users.json` |
 | `src/voice.rs` | Whisper transcription (OpenAI or local) + AudD song recognition |
 
@@ -47,6 +48,7 @@ All handlers receive a clone of `BotState` which holds:
 - `users: UsersDb` — `Arc<RwLock<HashMap<String, UserSettings>>>` backed by users.json
 - `bitrate: Arc<Mutex<u8>>` — app-wide quality setting, mutable at runtime via `/settings`
 - `pending_voices: Arc<Mutex<HashMap<String, String>>>` — short_id → Telegram file_id (see below)
+- `current_arl: Arc<Mutex<String>>` — active ARL (updated via /updatearl), used for automatic session re-login
 
 ### Dialogue state machine
 
@@ -64,9 +66,11 @@ All states return to `Idle` after handling. Voice notes received in `Idle` show 
 
 **Static musl binary** — compiled with `--target x86_64-unknown-linux-musl`, runs from a `scratch` Docker image with only CA certs and docker CLI. All TLS via rustls (no OpenSSL dependency).
 
-**deemix session auth** — deemix uses cookie-based auth (`connect.sid`). The bot calls `/api/loginArl` on startup to establish the session. **deemix must run with `DEEMIX_SINGLE_USER=true`** or all POST requests return `NotLoggedIn`.
+**deemix session auth** — deemix uses cookie-based auth (`connect.sid`). The bot calls `/api/loginArl` on startup to establish the session. **deemix must run with `DEEMIX_SINGLE_USER=true`** or all POST requests return `NotLoggedIn`. deemix's session store is an in-memory store with a ~24h TTL, so the bot's session eventually expires; `deemix::add_to_queue` detects `NotLoggedIn`, re-logs-in with `current_arl`, and retries once.
 
-**No Spotify API** — Spotify links are resolved by scraping `open.spotify.com/embed/track/ID?utm_source=oembed` for `__NEXT_DATA__` JSON. Falls back to oEmbed for title-only. Spotify playlists, YouTube, YouTube Music, and Apple Music links are resolved via the Odesli API (song.link) to get a Deezer URL and queued directly.
+**No Spotify API** — Spotify links are resolved by scraping `open.spotify.com/embed/track/ID?utm_source=oembed` for `__NEXT_DATA__` JSON. Falls back to oEmbed for title-only. Single YouTube, YouTube Music, and Apple Music links are resolved via the Odesli API (song.link) to get a Deezer URL and queued directly.
+
+**Playlist scanning** — Spotify playlists are scanned from the embed page `trackList` (works for user-generated playlists; ~first 100 tracks). YouTube playlists are scanned from the playlist page's `ytInitialData` JSON (~first 100 videos; auto-generated mixes `list=RD...` can't be scanned). Each track is searched on Deezer and the first match queued individually, with a progress/summary message. Queue-removal endpoints: `removeFromQueue` takes `uuid` as a **query param** (not JSON body); `removeFinishedDownloads` clears `status == "completed"` items.
 
 **Voice callback IDs** — Telegram callback data has a 64-byte limit. Voice note file IDs are stored in `pending_voices` HashMap keyed by short IDs; callbacks use `vt:{id}` (transcribe) and `vr:{id}` (recognize).
 
