@@ -39,6 +39,8 @@ Teleemix is a Telegram bot that lets users request music downloads from a self-h
 | `src/youtube.rs` | YouTube playlist scanner via `ytInitialData` scraping — no API key required |
 | `src/users.rs` | Per-user settings persistence backed by `users.json` |
 | `src/voice.rs` | Whisper transcription (OpenAI or local) + AudD song recognition |
+| `src/mediaserver.rs` | Plex / Jellyfin / Navidrome (Subsonic) clients: scan, track search, playlist rebuild |
+| `src/jobs.rs` | Persistent playlist-rebuild jobs (`jobs.json`), background worker, resumed on startup |
 
 ### Shared state (`BotState`)
 
@@ -49,6 +51,8 @@ All handlers receive a clone of `BotState` which holds:
 - `bitrate: Arc<Mutex<u8>>` — app-wide quality setting, mutable at runtime via `/settings`
 - `pending_voices: Arc<Mutex<HashMap<String, String>>>` — short_id → Telegram file_id (see below)
 - `current_arl: Arc<Mutex<String>>` — active ARL (updated via /updatearl), used for automatic session re-login
+- `media: Option<MediaServer>` — playlist rebuild target, built from `MEDIA_SERVER` env (None = feature off)
+- `jobs: JobsDb` — `Arc<RwLock<Vec<PlaylistJob>>>` backed by jobs.json
 
 ### Dialogue state machine
 
@@ -78,6 +82,8 @@ All states return to `Idle` after handling. Voice notes received in `Idle` show 
 
 **Runtime bitrate** — stored in `Arc<Mutex<u8>>`, app-wide (not per-user), resets to `DEEMIX_BITRATE` env var on restart. `DEEMIX_BITRATE_LOCK=true` disables user changes.
 
+**Playlist rebuild jobs** — when `MEDIA_SERVER` is configured, `queue_playlist` records each queued track's deemix uuid (from the `addToQueue` response `data.obj`) plus its **Deezer** title/artist (deemix tags files with Deezer metadata, so that's what the media server indexes). A background tokio task polls `getQueue` until all uuids are terminal (uuid missing from queue = done, e.g. cleared), triggers a library scan, matches tracks by title+artist with retries, then deletes and recreates the same-named playlist. Jobs are persisted to `jobs.json` and respawned by `jobs::resume_all` on startup. Plex needs `machineIdentifier` + music section key (resolved in `MediaServer::connect`); Jellyfin playlist creation requires a `UserId`; Navidrome uses the Subsonic API with salted-md5 token auth.
+
 ## Environment Variables
 
 Copy `.env.example` to `.env`. Required variables:
@@ -91,6 +97,11 @@ Copy `.env.example` to `.env`. Required variables:
 | `AUDD_API_KEY` | Optional: enables song recognition |
 | `OPENAI_API_KEY` | Optional: enables Whisper via OpenAI |
 | `WHISPER_URL` | Optional: enables local Whisper-compatible server |
+| `MEDIA_SERVER` | Optional: `plex`, `jellyfin` or `navidrome` — enables playlist rebuild |
+| `PLEX_URL` / `PLEX_TOKEN` | Required when `MEDIA_SERVER=plex` |
+| `JELLYFIN_URL` / `JELLYFIN_API_KEY` / `JELLYFIN_USER_ID` | Required when `MEDIA_SERVER=jellyfin` |
+| `NAVIDROME_URL` / `NAVIDROME_USER` / `NAVIDROME_PASSWORD` | Required when `MEDIA_SERVER=navidrome` |
+| `JOBS_FILE` | Playlist job persistence (default: `/app/jobs.json`) |
 
 ## CI/CD
 

@@ -52,7 +52,9 @@ async fn relogin(state: &Arc<BotState>) -> Result<(), String> {
     login_arl(state, &arl).await.map(|_| ())
 }
 
-pub async fn add_to_queue(state: &Arc<BotState>, url: &str) -> Result<(), String> {
+/// Queue a URL on deemix. Returns the queue uuids of the created download
+/// objects (empty when the item was already in the queue).
+pub async fn add_to_queue(state: &Arc<BotState>, url: &str) -> Result<Vec<String>, String> {
     match add_to_queue_once(state, url).await {
         Err(e) if e.eq_ignore_ascii_case("notloggedin") => {
             relogin(state).await?;
@@ -62,7 +64,7 @@ pub async fn add_to_queue(state: &Arc<BotState>, url: &str) -> Result<(), String
     }
 }
 
-async fn add_to_queue_once(state: &Arc<BotState>, url: &str) -> Result<(), String> {
+async fn add_to_queue_once(state: &Arc<BotState>, url: &str) -> Result<Vec<String>, String> {
     let bitrate = *state.current_bitrate.lock().await;
     let endpoint = format!("{}/api/addToQueue", state.config.deemix_url);
     let resp = state
@@ -76,13 +78,45 @@ async fn add_to_queue_once(state: &Arc<BotState>, url: &str) -> Result<(), Strin
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
 
     if data["result"].as_bool().unwrap_or(false) {
-        Ok(())
+        let uuids = data["data"]["obj"]
+            .as_array()
+            .map(|objs| {
+                objs.iter()
+                    .filter_map(|o| o["uuid"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(uuids)
     } else {
         Err(data["errid"]
             .as_str()
             .unwrap_or("Unknown error")
             .to_string())
     }
+}
+
+/// Map of queue item uuid → status ("inQueue", "downloading", "completed",
+/// "failed", "withErrors"). Used by playlist jobs to track downloads.
+pub async fn queue_status_map(state: &Arc<BotState>) -> Result<std::collections::HashMap<String, String>, String> {
+    let url = format!("{}/api/getQueue", state.config.deemix_url);
+    let resp = state.http.get(&url).send().await.map_err(|e| e.to_string())?;
+    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let mut map = std::collections::HashMap::new();
+    if let Some(queue) = data["queue"].as_object() {
+        for (uuid, item) in queue {
+            let status = match item["status"].as_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    let downloaded = item["downloaded"].as_u64().unwrap_or(0);
+                    let size = item["size"].as_u64().unwrap_or(1);
+                    if downloaded >= size && size > 0 { "completed".to_string() } else { "inQueue".to_string() }
+                }
+            };
+            map.insert(uuid.clone(), status);
+        }
+    }
+    Ok(map)
 }
 
 pub struct QueueStatus {

@@ -20,6 +20,8 @@ mod deemix;
 mod users;
 mod voice;
 mod youtube;
+mod mediaserver;
+mod jobs;
 
 use users::{UsersDb, UserSettings};
 
@@ -50,6 +52,7 @@ pub struct Config {
     pub service_name: String,
     pub env_file: String,
     pub users_file: String,
+    pub jobs_file: String,
     pub audd_api_key: String,
     pub openai_api_key: String,
     pub whisper_url: String,
@@ -71,6 +74,8 @@ impl Config {
                 .unwrap_or_else(|_| "/app/.env".to_string()),
             users_file: env::var("USERS_FILE")
                 .unwrap_or_else(|_| "/app/users.json".to_string()),
+            jobs_file: env::var("JOBS_FILE")
+                .unwrap_or_else(|_| "/app/jobs.json".to_string()),
             audd_api_key: env::var("AUDD_API_KEY").unwrap_or_default(),
             openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
             whisper_url: env::var("WHISPER_URL").unwrap_or_default(),
@@ -94,6 +99,8 @@ pub struct BotState {
     pub pending_voices: Arc<Mutex<HashMap<String, String>>>, // short_id -> file_id
     pub current_bitrate: Arc<Mutex<u8>>, // runtime-changeable bitrate
     pub current_arl: Arc<Mutex<String>>, // updated via /updatearl, used for auto re-login
+    pub media: Option<mediaserver::MediaServer>, // optional playlist rebuild target
+    pub jobs: jobs::JobsDb, // pending playlist rebuild jobs, persisted to jobs.json
 }
 
 impl BotState {
@@ -104,6 +111,11 @@ impl BotState {
             .expect("Failed to build HTTP client");
         let default_bitrate = config.deemix_bitrate;
         let default_arl = config.deemix_arl.clone();
+        let media = mediaserver::MediaServer::from_env();
+        if let Some(ref m) = media {
+            log::info!("Playlist rebuild enabled for {}", m.label());
+        }
+        let jobs = jobs::load(&config.jobs_file);
         Self {
             config: Arc::new(config),
             http,
@@ -111,6 +123,8 @@ impl BotState {
             pending_voices: Arc::new(Mutex::new(HashMap::new())),
             current_bitrate: Arc::new(Mutex::new(default_bitrate)),
             current_arl: Arc::new(Mutex::new(default_arl)),
+            media,
+            jobs,
         }
     }
 }
@@ -187,6 +201,9 @@ async fn main() {
     deemix::login(&state).await;
 
     log::info!("Teleemix bot starting...");
+
+    // Resume playlist rebuild jobs that were pending before the last restart
+    jobs::resume_all(&bot, &state);
 
     // Send startup notification to users with restart_notifications enabled
     {
@@ -1336,13 +1353,11 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
     Ok(())
 }
 
-fn first_link(results: &[serde_json::Value]) -> Option<String> {
-    results.first().and_then(|x| x["link"].as_str()).map(|s| s.to_string())
-}
-
 /// Queue every track of a scanned playlist by searching it on Deezer and
 /// queuing the first match. Edits the status message with progress and a
-/// final summary of anything that couldn't be found.
+/// final summary of anything that couldn't be found. When a media server is
+/// configured, also creates a persistent rebuild job that recreates the
+/// playlist there once all downloads finish.
 async fn queue_playlist(
     bot: &Bot,
     msg: &Message,
@@ -1353,6 +1368,7 @@ async fn queue_playlist(
     let total = pl.tracks.len();
     let mut queued = 0usize;
     let mut not_found: Vec<String> = Vec::new();
+    let mut job_tracks: Vec<jobs::JobTrack> = Vec::new();
 
     for (i, track) in pl.tracks.iter().enumerate() {
         if i % 5 == 0 {
@@ -1365,11 +1381,11 @@ async fn queue_playlist(
         } else {
             format!("{} {}", track.title, track.artist)
         };
-        let mut link = deemix::search(state, &full_query, "track").await.ok()
-            .and_then(|r| first_link(&r));
-        if link.is_none() && !track.artist.is_empty() {
-            link = deemix::search(state, &track.title, "track").await.ok()
-                .and_then(|r| first_link(&r));
+        let mut found = deemix::search(state, &full_query, "track").await.ok()
+            .and_then(|r| r.first().cloned());
+        if found.is_none() && !track.artist.is_empty() {
+            found = deemix::search(state, &track.title, "track").await.ok()
+                .and_then(|r| r.first().cloned());
         }
 
         let label = if track.artist.is_empty() {
@@ -1377,9 +1393,19 @@ async fn queue_playlist(
         } else {
             format!("{} — {}", track.title, track.artist)
         };
-        match link {
-            Some(l) => match deemix::add_to_queue(state, &l).await {
-                Ok(_) => queued += 1,
+        match found.as_ref().and_then(|f| f["link"].as_str()) {
+            Some(link) => match deemix::add_to_queue(state, link).await {
+                Ok(uuids) => {
+                    queued += 1;
+                    // Track with the Deezer metadata: that's what deemix tags
+                    // the files with, so it's what the media server will index
+                    let found = found.as_ref().unwrap();
+                    job_tracks.push(jobs::JobTrack {
+                        title: found["title"].as_str().unwrap_or(&track.title).to_string(),
+                        artist: found["artist"]["name"].as_str().unwrap_or(&track.artist).to_string(),
+                        uuid: uuids.into_iter().next().unwrap_or_default(),
+                    });
+                }
                 Err(e) => {
                     log::warn!("[playlist] failed to queue {:?}: {}", label, e);
                     not_found.push(label);
@@ -1404,6 +1430,28 @@ async fn queue_playlist(
             text.push_str(&format!("…and {} more", not_found.len() - 15));
         }
     }
+
+    if let Some(server) = &state.media {
+        if !job_tracks.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let job = jobs::PlaylistJob {
+                id: format!("{}-{}", msg.chat.id.0, now),
+                chat_id: msg.chat.id.0,
+                name: pl.name.clone(),
+                tracks: job_tracks,
+            };
+            jobs::add(state, job.clone());
+            jobs::spawn(bot.clone(), Arc::clone(state), job);
+            text.push_str(&format!(
+                "\n\n🎧 I'll rebuild this playlist in {} once all downloads finish.",
+                server.label()
+            ));
+        }
+    }
+
     bot.edit_message_text(msg.chat.id, status_id, text).await?;
     Ok(())
 }
