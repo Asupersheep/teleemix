@@ -36,6 +36,8 @@ pub enum State {
     AwaitingAlbum,
     AwaitingDl,
     AwaitingSpotify,
+    AwaitingPlaylistImport,
+    AwaitingPlaylistClone,
     AwaitingVoiceTranscribe,
     AwaitingVoiceRecognize,
 }
@@ -97,6 +99,7 @@ pub struct BotState {
     pub http: Client,
     pub users: UsersDb,
     pub pending_voices: Arc<Mutex<HashMap<String, String>>>, // short_id -> file_id
+    pub pending_playlists: Arc<Mutex<HashMap<String, String>>>, // short_id -> playlist url (import/clone choice)
     pub current_bitrate: Arc<Mutex<u8>>, // runtime-changeable bitrate
     pub current_arl: Arc<Mutex<String>>, // updated via /updatearl, used for auto re-login
     pub media: Option<mediaserver::MediaServer>, // optional playlist rebuild target
@@ -121,6 +124,7 @@ impl BotState {
             http,
             users,
             pending_voices: Arc::new(Mutex::new(HashMap::new())),
+            pending_playlists: Arc::new(Mutex::new(HashMap::new())),
             current_bitrate: Arc::new(Mutex::new(default_bitrate)),
             current_arl: Arc::new(Mutex::new(default_arl)),
             media,
@@ -224,6 +228,8 @@ async fn main() {
                 .branch(dptree::case![State::AwaitingAlbum].endpoint(receive_album))
                 .branch(dptree::case![State::AwaitingDl].endpoint(receive_dl))
                 .branch(dptree::case![State::AwaitingSpotify].endpoint(receive_spotify))
+                .branch(dptree::case![State::AwaitingPlaylistImport].endpoint(receive_playlist_import))
+                .branch(dptree::case![State::AwaitingPlaylistClone].endpoint(receive_playlist_clone))
                 .branch(dptree::case![State::AwaitingVoiceTranscribe].endpoint(receive_voice_transcribe))
                 .branch(dptree::case![State::AwaitingVoiceRecognize].endpoint(receive_voice_recognize))
                 .branch(
@@ -279,7 +285,8 @@ fn arl_cancel_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("❌ Cancel", "cancel_arl")]])
 }
 
-fn main_keyboard(s: &UserSettings, config: &Config) -> KeyboardMarkup {
+fn main_keyboard(s: &UserSettings, state: &BotState) -> KeyboardMarkup {
+    let config = &state.config;
     let mut rows = vec![
         vec![
             KeyboardButton::new("🔍 Search a track"),
@@ -290,6 +297,12 @@ fn main_keyboard(s: &UserSettings, config: &Config) -> KeyboardMarkup {
             KeyboardButton::new("🎵 From Deezer URL"),
         ],
     ];
+
+    let mut playlist_row = vec![KeyboardButton::new("📥 Import playlist")];
+    if state.media.is_some() {
+        playlist_row.push(KeyboardButton::new("🎧 Clone playlist"));
+    }
+    rows.push(playlist_row);
 
     // Only show voice buttons if features are configured AND user has them enabled
     let show_voice = config.whisper_enabled() && s.voice_search;
@@ -329,7 +342,7 @@ async fn handle_command(
 
     match cmd {
         Command::Start => {
-            let kb = main_keyboard(&user_settings, &state.config);
+            let kb = main_keyboard(&user_settings, &state);
             bot.send_message(
                 msg.chat.id,
                 "👋 Hey! I'm Teleemix — your personal music download assistant.\n\nJust send me a song name, a Deezer link, or a Spotify link and I'll find it and queue it for download on your server. No technical stuff needed!\n\n📲 Use /menu to see quick action buttons.\n\nFor a full list of what I can do, type /help.",
@@ -350,6 +363,10 @@ I connect to your personal deemix server and queue music downloads for you. Just
 • Send a Spotify, YouTube, YouTube Music, or Apple Music link → found on Deezer and queued\n\
 • Send a Spotify or YouTube playlist link → every track is scanned and queued individually\n\
 • Send a voice note → transcribe what you said or recognize the song\n\n\
+📜 Playlists:\n\
+• 📥 Import playlist — downloads every song from a Spotify/YouTube playlist\n\
+• 🎧 Clone playlist — same, plus rebuilds the playlist (same name) in your media server (Plex, Jellyfin or Navidrome) once all downloads finish — works even if everything was already downloaded\n\
+Both are in /menu; pasting a playlist link directly also offers the choice.\n\n\
 🔧 All commands:\n\
 /menu — quick action buttons\n\
 /search — search for a track\n\
@@ -417,7 +434,7 @@ I connect to your personal deemix server and queue music downloads for you. Just
         }
 
         Command::Menu => {
-            let kb = main_keyboard(&user_settings, &state.config);
+            let kb = main_keyboard(&user_settings, &state);
             bot.send_message(msg.chat.id, "Choose an action:").reply_markup(kb).await?;
         }
 
@@ -463,6 +480,33 @@ async fn receive_spotify(bot: Bot, msg: Message, state: Arc<BotState>, dialogue:
     dialogue.exit().await.ok();
     if let Some(url) = msg.text() { handle_streaming_link(&bot, &msg, &state, url.trim()).await?; }
     Ok(())
+}
+
+async fn receive_playlist_import(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyDialogue) -> ResponseResult<()> {
+    dialogue.exit().await.ok();
+    if let Some(url) = msg.text() {
+        receive_playlist_link(&bot, &msg, &state, url.trim(), false).await?;
+    }
+    Ok(())
+}
+
+async fn receive_playlist_clone(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyDialogue) -> ResponseResult<()> {
+    dialogue.exit().await.ok();
+    if let Some(url) = msg.text() {
+        // Defensive: the clone button is hidden when no media server is configured
+        let rebuild = state.media.is_some();
+        receive_playlist_link(&bot, &msg, &state, url.trim(), rebuild).await?;
+    }
+    Ok(())
+}
+
+async fn receive_playlist_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, url: &str, rebuild: bool) -> ResponseResult<()> {
+    if !is_playlist_link(url) {
+        bot.send_message(msg.chat.id, "❌ That doesn't look like a Spotify or YouTube playlist link. Use /menu to try again.").await?;
+        return Ok(());
+    }
+    let sent = bot.send_message(msg.chat.id, "🎵 Looking up playlist...").await?;
+    start_playlist_flow(bot, msg.chat.id, state, sent.id, url, rebuild).await
 }
 
 async fn receive_arl(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyDialogue) -> ResponseResult<()> {
@@ -741,6 +785,25 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
             bot.send_message(msg.chat.id, "🎵 Send me a Deezer URL:").await?;
             return Ok(());
         }
+        "📥 Import playlist" => {
+            dialogue.update(State::AwaitingPlaylistImport).await.ok();
+            bot.send_message(msg.chat.id, "📥 Send me a Spotify or YouTube playlist link and I'll download every song:").await?;
+            return Ok(());
+        }
+        "🎧 Clone playlist" => {
+            match &state.media {
+                Some(server) => {
+                    dialogue.update(State::AwaitingPlaylistClone).await.ok();
+                    bot.send_message(msg.chat.id, format!(
+                        "🎧 Send me a Spotify or YouTube playlist link — I'll download every song and rebuild the playlist in {}:",
+                        server.label())).await?;
+                }
+                None => {
+                    bot.send_message(msg.chat.id, "⚠️ No media server is configured. Set MEDIA_SERVER in your .env to enable playlist cloning.").await?;
+                }
+            }
+            return Ok(());
+        }
         "🎤 Voice search" => {
             if !state.config.whisper_enabled() || !user_settings.voice_search {
                 bot.send_message(msg.chat.id, "⚠️ Voice search is not configured. Add OPENAI_API_KEY or WHISPER_URL to your .env, or enable it in /settings.").await?;
@@ -815,7 +878,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
             return Ok(());
         }
         "🔙 Back to menu" => {
-            let kb = main_keyboard(&user_settings, &state.config);
+            let kb = main_keyboard(&user_settings, &state);
             bot.send_message(msg.chat.id, "Choose an action:").reply_markup(kb).await?;
             return Ok(());
         }
@@ -837,6 +900,9 @@ I connect to your personal deemix server and queue music downloads. Just tell me
 • Send a Spotify, YouTube, YouTube Music, or Apple Music link → found on Deezer and queued\n\
 • Send a Spotify or YouTube playlist link → every track is scanned and queued individually\n\
 • Send a voice note → transcribe or recognize\n\n\
+📜 Playlists (via /menu):\n\
+• 📥 Import playlist — download every song from a Spotify/YouTube playlist\n\
+• 🎧 Clone playlist — import + rebuild the playlist in your media server\n\n\
 🔧 Commands:\n\
 /menu — quick action buttons\n\
 /search — search for a track\n\
@@ -990,6 +1056,25 @@ async fn handle_callback(
             let dialogue: MyDialogue = Dialogue::new(storage, msg.chat.id);
             dialogue.exit().await.ok();
             bot.edit_message_text(msg.chat.id, msg.id, "❌ ARL update cancelled.").await?;
+        }
+        return Ok(());
+    }
+
+    // ── Playlist import/clone choice ──
+    let is_pl_import = data.starts_with("pi:");
+    let is_pl_clone = data.starts_with("pc:");
+    if is_pl_import || is_pl_clone {
+        if let Some(msg) = &q.message {
+            let short_id = &data[3..];
+            let url = state.pending_playlists.lock().await.remove(short_id);
+            match url {
+                Some(url) => {
+                    start_playlist_flow(&bot, msg.chat.id, &state, msg.id, &url, is_pl_clone).await?;
+                }
+                None => {
+                    bot.edit_message_text(msg.chat.id, msg.id, "❌ That playlist link expired. Please send it again.").await?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1291,14 +1376,57 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
         return Ok(());
     }
 
+    // Playlist link: with a media server configured, ask whether to import
+    // (download only) or clone (download + rebuild the playlist there)
+    if is_playlist_link(url) {
+        match &state.media {
+            Some(server) => {
+                let short_id = format!("{}", msg.id.0);
+                state.pending_playlists.lock().await.insert(short_id.clone(), url.to_string());
+                let buttons = vec![
+                    vec![InlineKeyboardButton::callback("📥 Import — download the songs", format!("pi:{}", short_id))],
+                    vec![InlineKeyboardButton::callback(
+                        format!("🎧 Clone — also rebuild in {}", server.label()),
+                        format!("pc:{}", short_id))],
+                    vec![InlineKeyboardButton::callback("❌ Cancel", "cancel")],
+                ];
+                bot.edit_message_text(msg.chat.id, sent.id, "📜 That's a playlist! What should I do?")
+                    .reply_markup(InlineKeyboardMarkup::new(buttons))
+                    .await?;
+            }
+            None => {
+                start_playlist_flow(bot, msg.chat.id, state, sent.id, url, false).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    queue_single_via_odesli(bot, msg.chat.id, state, sent.id, url).await
+}
+
+fn is_playlist_link(url: &str) -> bool {
+    SPOTIFY_PLAYLIST_RE.is_match(url)
+        || (YOUTUBE_RE.is_match(url) && youtube::playlist_id(url).is_some())
+}
+
+/// Scan a Spotify/YouTube playlist and queue each track. `rebuild` controls
+/// whether a media-server playlist rebuild job is created afterwards.
+async fn start_playlist_flow(
+    bot: &Bot,
+    chat: ChatId,
+    state: &Arc<BotState>,
+    status_id: teloxide::types::MessageId,
+    url: &str,
+    rebuild: bool,
+) -> ResponseResult<()> {
     // Spotify playlist: scan the track list and queue each song individually,
     // so user-generated playlists work (Deezer rarely has a same-named playlist)
     if SPOTIFY_PLAYLIST_RE.is_match(url) {
-        bot.edit_message_text(msg.chat.id, sent.id, "🔍 Reading Spotify playlist...").await?;
+        bot.edit_message_text(chat, status_id, "🔍 Reading Spotify playlist...").await?;
         match spotify::resolve_playlist(url).await {
-            Some(pl) => { queue_playlist(bot, msg, state, sent.id, &pl).await?; }
+            Some(pl) => { queue_playlist(bot, chat, state, status_id, &pl, rebuild).await?; }
             None => {
-                bot.edit_message_text(msg.chat.id, sent.id,
+                bot.edit_message_text(chat, status_id,
                     "😕 Couldn't read that Spotify playlist. Make sure it's public and try again.").await?;
             }
         }
@@ -1306,46 +1434,50 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
     }
 
     // YouTube playlist: same per-track treatment
-    let mut url = url.to_string();
-    if YOUTUBE_RE.is_match(&url) && youtube::playlist_id(&url).is_some() {
-        bot.edit_message_text(msg.chat.id, sent.id, "🔍 Reading YouTube playlist...").await?;
-        match youtube::resolve_playlist(&state.http, &url).await {
-            Some(pl) => {
-                queue_playlist(bot, msg, state, sent.id, &pl).await?;
-                return Ok(());
-            }
-            None => {
-                if url.contains("watch?v=") || url.contains("youtu.be/") {
-                    // Mixes and private lists can't be scanned — fall back to the single video
-                    url = youtube::strip_playlist_params(&url);
-                } else {
-                    bot.edit_message_text(msg.chat.id, sent.id,
-                        "😕 Couldn't read that YouTube playlist. Make sure it's public and try again.").await?;
-                    return Ok(());
-                }
+    bot.edit_message_text(chat, status_id, "🔍 Reading YouTube playlist...").await?;
+    match youtube::resolve_playlist(&state.http, url).await {
+        Some(pl) => {
+            queue_playlist(bot, chat, state, status_id, &pl, rebuild).await?;
+        }
+        None => {
+            if url.contains("watch?v=") || url.contains("youtu.be/") {
+                // Mixes and private lists can't be scanned — fall back to the single video
+                let single = youtube::strip_playlist_params(url);
+                queue_single_via_odesli(bot, chat, state, status_id, &single).await?;
+            } else {
+                bot.edit_message_text(chat, status_id,
+                    "😕 Couldn't read that YouTube playlist. Make sure it's public and try again.").await?;
             }
         }
     }
-    let url = url.as_str();
+    Ok(())
+}
 
-    // Single YouTube video / Apple Music: convert via Odesli to a Deezer URL and queue directly
+/// Single YouTube video / Apple Music: convert via Odesli to a Deezer URL and queue directly.
+async fn queue_single_via_odesli(
+    bot: &Bot,
+    chat: ChatId,
+    state: &Arc<BotState>,
+    status_id: teloxide::types::MessageId,
+    url: &str,
+) -> ResponseResult<()> {
     let service = if YOUTUBE_RE.is_match(url) {
         "YouTube link".to_string()
     } else {
         "Apple Music link".to_string()
     };
 
-    bot.edit_message_text(msg.chat.id, sent.id, format!("🔍 Looking up {} on Deezer...", service)).await?;
+    bot.edit_message_text(chat, status_id, format!("🔍 Looking up {} on Deezer...", service)).await?;
 
     match voice::lookup_deezer_via_spotify(&state.http, url).await {
         Some(deezer_url) => {
             match deemix::add_to_queue(state, &deezer_url).await {
-                Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} added to queue!", capitalize(&service))).await?; }
-                Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?; }
+                Ok(_) => { bot.edit_message_text(chat, status_id, format!("✅ {} added to queue!", capitalize(&service))).await?; }
+                Err(e) => { bot.edit_message_text(chat, status_id, format!("❌ Failed to queue: {}", e)).await?; }
             }
         }
         None => {
-            bot.edit_message_text(msg.chat.id, sent.id,
+            bot.edit_message_text(chat, status_id,
                 format!("😕 Couldn't find this {} on Deezer. Try searching by name with /search.", service)).await?;
         }
     }
@@ -1355,15 +1487,16 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
 
 /// Queue every track of a scanned playlist by searching it on Deezer and
 /// queuing the first match. Edits the status message with progress and a
-/// final summary of anything that couldn't be found. When a media server is
-/// configured, also creates a persistent rebuild job that recreates the
-/// playlist there once all downloads finish.
+/// final summary of anything that couldn't be found. With `rebuild` set (and
+/// a media server configured), also creates a persistent job that recreates
+/// the playlist there once all downloads finish.
 async fn queue_playlist(
     bot: &Bot,
-    msg: &Message,
+    chat: ChatId,
     state: &Arc<BotState>,
     status_id: teloxide::types::MessageId,
     pl: &spotify::Playlist,
+    rebuild: bool,
 ) -> ResponseResult<()> {
     let total = pl.tracks.len();
     let mut queued = 0usize;
@@ -1372,7 +1505,7 @@ async fn queue_playlist(
 
     for (i, track) in pl.tracks.iter().enumerate() {
         if i % 5 == 0 {
-            let _ = bot.edit_message_text(msg.chat.id, status_id,
+            let _ = bot.edit_message_text(chat, status_id,
                 format!("⏳ Queuing \"{}\" — {}/{} tracks...", pl.name, i, total)).await;
         }
 
@@ -1431,28 +1564,30 @@ async fn queue_playlist(
         }
     }
 
-    if let Some(server) = &state.media {
-        if !job_tracks.is_empty() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let job = jobs::PlaylistJob {
-                id: format!("{}-{}", msg.chat.id.0, now),
-                chat_id: msg.chat.id.0,
-                name: pl.name.clone(),
-                tracks: job_tracks,
-            };
-            jobs::add(state, job.clone());
-            jobs::spawn(bot.clone(), Arc::clone(state), job);
-            text.push_str(&format!(
-                "\n\n🎧 I'll rebuild this playlist in {} once all downloads finish.",
-                server.label()
-            ));
+    if rebuild {
+        if let Some(server) = &state.media {
+            if !job_tracks.is_empty() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let job = jobs::PlaylistJob {
+                    id: format!("{}-{}", chat.0, now),
+                    chat_id: chat.0,
+                    name: pl.name.clone(),
+                    tracks: job_tracks,
+                };
+                jobs::add(state, job.clone());
+                jobs::spawn(bot.clone(), Arc::clone(state), job);
+                text.push_str(&format!(
+                    "\n\n🎧 I'll rebuild this playlist in {} once all downloads finish.",
+                    server.label()
+                ));
+            }
         }
     }
 
-    bot.edit_message_text(msg.chat.id, status_id, text).await?;
+    bot.edit_message_text(chat, status_id, text).await?;
     Ok(())
 }
 

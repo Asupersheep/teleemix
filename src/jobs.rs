@@ -101,9 +101,16 @@ async fn run(bot: Bot, state: Arc<BotState>, job: PlaylistJob) {
     log::info!("[job {}] started: playlist \"{}\", {} tracks", job.id, job.name, job.tracks.len());
 
     // ── Phase 1: wait for deemix downloads ──
+    // Tracks without a uuid were already in the deemix queue (e.g. downloaded
+    // before) — nothing to wait for. If no track needs waiting, go straight
+    // to the rebuild so cloning an already-downloaded playlist still works.
+    let tracked = job.tracks.iter().filter(|t| !t.uuid.is_empty()).count();
+    if tracked == 0 {
+        log::info!("[job {}] no downloads to wait for, rebuilding immediately", job.id);
+    }
     let mut polls = 0usize;
     let mut last_map = std::collections::HashMap::new();
-    loop {
+    while tracked > 0 {
         match deemix::queue_status_map(&state).await {
             Ok(map) => {
                 let pending = job.tracks.iter()

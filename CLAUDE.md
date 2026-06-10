@@ -60,6 +60,7 @@ teloxide's `Dialogue<State, InMemStorage<State>>` drives all multi-step interact
 
 ```
 Idle → AwaitingSearch / AwaitingAlbum / AwaitingDl / AwaitingSpotify
+     → AwaitingPlaylistImport / AwaitingPlaylistClone (menu buttons; clone only when MEDIA_SERVER set)
      → AwaitingArl (via /updatearl)
      → AwaitingVoiceTranscribe / AwaitingVoiceRecognize (voice notes, 60s timeout)
 ```
@@ -82,7 +83,9 @@ All states return to `Idle` after handling. Voice notes received in `Idle` show 
 
 **Runtime bitrate** — stored in `Arc<Mutex<u8>>`, app-wide (not per-user), resets to `DEEMIX_BITRATE` env var on restart. `DEEMIX_BITRATE_LOCK=true` disables user changes.
 
-**Playlist rebuild jobs** — when `MEDIA_SERVER` is configured, `queue_playlist` records each queued track's deemix uuid (from the `addToQueue` response `data.obj`) plus its **Deezer** title/artist (deemix tags files with Deezer metadata, so that's what the media server indexes). A background tokio task polls `getQueue` until all uuids are terminal (uuid missing from queue = done, e.g. cleared), triggers a library scan, matches tracks by title+artist with retries, then deletes and recreates the same-named playlist. Jobs are persisted to `jobs.json` and respawned by `jobs::resume_all` on startup. Plex needs `machineIdentifier` + music section key (resolved in `MediaServer::connect`); Jellyfin playlist creation requires a `UserId`; Navidrome uses the Subsonic API with salted-md5 token auth.
+**Import vs. clone** — pasting a playlist link with `MEDIA_SERVER` configured shows an inline choice: import (download only) or clone (download + rebuild job). The URL is stashed in `pending_playlists` keyed by a short id (`pi:{id}`/`pc:{id}` callbacks, 64-byte limit). Cloning a fully-already-downloaded playlist skips the download wait and rebuilds immediately.
+
+**Playlist rebuild jobs** — when cloning, `queue_playlist` records each queued track's deemix uuid (from the `addToQueue` response `data.obj`) plus its **Deezer** title/artist (deemix tags files with Deezer metadata, so that's what the media server indexes). A background tokio task polls `getQueue` until all uuids are terminal (uuid missing from queue = done, e.g. cleared), triggers a library scan, matches tracks by title+artist with retries, then deletes and recreates the same-named playlist. Jobs are persisted to `jobs.json` and respawned by `jobs::resume_all` on startup. Plex needs `machineIdentifier` + music section key (resolved in `MediaServer::connect`); Jellyfin playlist creation requires a `UserId`; Navidrome uses the Subsonic API with salted-md5 token auth.
 
 ## Environment Variables
 

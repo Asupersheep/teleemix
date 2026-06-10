@@ -11,6 +11,8 @@ services:
       - /path/to/your/.env:/app/.env
       # Persistent user settings and notification registry.
       - /path/to/your/data/users.json:/app/users.json
+      # Persistent playlist-clone jobs (survive bot restarts).
+      - /path/to/your/data/jobs.json:/app/jobs.json
       # Allows the bot to talk to Docker.
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:

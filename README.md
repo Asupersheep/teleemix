@@ -31,9 +31,11 @@ Supports Deezer URLs, Spotify links, YouTube, YouTube Music, Apple Music, voice 
 ## Features
 
 - 🎵 Send a **Deezer URL** (track, album, playlist) → queued instantly
-- 🔗 Send a **Spotify link** (track, album, or playlist) → looked up and queued automatically
+- 🔗 Send a **Spotify link** (track or album) → looked up and queued automatically
 - 🎬 Send a **YouTube or YouTube Music link** → resolved via Odesli and queued on Deezer
 - 🍎 Send an **Apple Music link** → resolved via Odesli and queued on Deezer
+- 📥 **Import a playlist** — send a Spotify or YouTube playlist link and every track is scanned, found on Deezer, and queued individually (works for user-generated playlists)
+- 🎧 **Clone a playlist** — same as import, plus the playlist is rebuilt with the same name in your media server (**Plex/Plexamp, Jellyfin, or Navidrome**) once all downloads finish; pending clones survive bot restarts
 - 🔍 Send a **song or artist name** → search results shown as buttons to pick from
 - 🎤 Send a **voice note** → transcribe what you said and search (requires OpenAI key)
 - 🎵 Send a **voice recording of a song** → identify it and queue it (requires AudD key)
@@ -98,9 +100,10 @@ volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-Create the registered users file before starting:
+Create the registered users and jobs files before starting (Docker creates directories instead of files if they don't exist):
 ```bash
 touch /path/to/your/data/registered_users.txt
+echo '[]' > /path/to/your/data/jobs.json
 ```
 
 ### 5. Deploy
@@ -117,6 +120,8 @@ docker compose up -d
 | Action | How |
 |---|---|
 | Download a track | Send a Deezer, Spotify, YouTube, or Apple Music link, or just type the song name |
+| Import a playlist | Send a Spotify/YouTube playlist link, or tap 📥 Import playlist in /menu |
+| Clone a playlist to your media server | Send a playlist link and pick 🎧 Clone, or tap 🎧 Clone playlist in /menu |
 | Search tracks | `/search` or tap 🔍 Search a track in /menu |
 | Search albums | `/album` or tap 💿 Search an album in /menu |
 | Download a Deezer URL | `/dl` |
@@ -128,6 +133,31 @@ docker compose up -d
 | Update ARL | `/updatearl` |
 | Personal settings | `/settings` |
 | Show all buttons | `/menu` |
+
+---
+
+## Playlist Import & Clone
+
+Send any **Spotify or YouTube playlist link** (or use the 📥 / 🎧 buttons in `/menu`):
+
+- **📥 Import** — the playlist is scanned (no API keys needed), each track is searched on Deezer, and the first match is queued. Works for user-generated playlists. You get a progress message and a summary of anything that couldn't be found.
+- **🎧 Clone** — everything Import does, *plus* the playlist is rebuilt with the same name in your media server once all downloads finish. If every track was already downloaded before, the playlist is still rebuilt immediately — no waiting.
+
+Notes: playlist pages expose roughly the first 100 tracks; YouTube auto-generated mixes (`list=RD...`) can't be scanned and are treated as a single video.
+
+### Setting up Clone (optional)
+
+Cloning needs a media server. Set `MEDIA_SERVER` in your `.env` to `plex`, `jellyfin`, or `navidrome` and fill in the matching variables (see `.env.example`):
+
+| Server | Variables | Notes |
+|---|---|---|
+| Plex | `PLEX_URL`, `PLEX_TOKEN` | Playlists show up in **Plexamp** automatically. [Finding your token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) |
+| Jellyfin | `JELLYFIN_URL`, `JELLYFIN_API_KEY`, `JELLYFIN_USER_ID` | API key: Dashboard → API Keys. User id: the `userId=...` part of the URL on the user's profile page. Playlists are created for that user. |
+| Navidrome | `NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD` | Uses the Subsonic API, so any Subsonic-compatible server (Airsonic, gonic, LMS) works too. |
+
+How a clone works behind the scenes: the bot tracks each queued download in the deemix queue, waits until they all finish, triggers a library scan, matches every track by its Deezer title + artist (deemix tags files with Deezer metadata), then deletes any same-named playlist and recreates it. The result message tells you how many tracks made it, plus which downloads failed or couldn't be matched.
+
+Pending clone jobs are saved to `jobs.json` (the `JOBS_FILE` mount) and **resume automatically after a bot restart**. If the media server is unreachable when downloads finish, the bot retries for 15 minutes and otherwise picks the job up again on the next restart.
 
 ---
 
