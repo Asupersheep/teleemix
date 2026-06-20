@@ -141,9 +141,23 @@ impl ServerSession {
     pub async fn find_track(&self, http: &Client, title: &str, artist: &str) -> Option<String> {
         match &self.server {
             MediaServer::Plex { url, token } => {
-                let path = format!("/library/sections/{}/all", self.plex_section);
-                let v = plex_get(http, url, token, &path, &[("type", "10"), ("title", title)]).await?;
-                let items = v["MediaContainer"]["Metadata"].as_array()?.clone();
+                // Try the title-filter endpoint first; if it returns nothing fall back
+                // to the full-text search endpoint which is more forgiving.
+                let filter_path = format!("/library/sections/{}/all", self.plex_section);
+                let items = plex_get(http, url, token, &filter_path, &[("type", "10"), ("title", title)]).await
+                    .and_then(|v| v["MediaContainer"]["Metadata"].as_array().cloned())
+                    .unwrap_or_default();
+                let items = if items.is_empty() {
+                    let search_path = format!("/library/sections/{}/search", self.plex_section);
+                    plex_get(http, url, token, &search_path, &[("type", "10"), ("query", title)]).await
+                        .and_then(|v| v["MediaContainer"]["Metadata"].as_array().cloned())
+                        .unwrap_or_default()
+                } else {
+                    items
+                };
+                if items.is_empty() {
+                    return None;
+                }
                 pick_match(&items, artist,
                     |i| i["grandparentTitle"].as_str().unwrap_or("").to_string()
                         + " " + i["originalTitle"].as_str().unwrap_or(""))

@@ -387,18 +387,26 @@ Both are in /menu; pasting a playlist link directly also offers the choice.\n\n\
         }
 
         Command::Status => {
+            let mut text = String::new();
             match deemix::get_queue(&state).await {
                 Ok(q) => {
-                    let mut text = "✅ Deemix is reachable\n".to_string();
+                    text.push_str("✅ Deemix is reachable\n");
                     if q.downloading > 0 { text.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { text.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
                     if q.failed > 0 { text.push_str(&format!("❌ Failed: {}\n", q.failed)); }
-                    if q.done > 0 { text.push_str(&format!("✅ Completed (in queue): {}", q.done)); }
-                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { text.push_str("📭 Queue is empty"); }
-                    bot.send_message(msg.chat.id, text).await?;
+                    if q.done > 0 { text.push_str(&format!("✅ Completed (in queue): {}\n", q.done)); }
+                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { text.push_str("📭 Queue is empty\n"); }
                 }
-                Err(e) => { bot.send_message(msg.chat.id, format!("❌ Can't reach deemix: {}", e)).await?; }
+                Err(e) => { text.push_str(&format!("❌ Can't reach deemix: {}\n", e)); }
             }
+            if let Some(server) = &state.media {
+                text.push('\n');
+                match server.connect(&state.http).await {
+                    Ok(_) => text.push_str(&format!("✅ {} is reachable", server.label())),
+                    Err(e) => text.push_str(&format!("❌ Can't reach {}: {}", server.label(), e)),
+                }
+            }
+            bot.send_message(msg.chat.id, text.trim_end().to_string()).await?;
         }
 
         Command::Dl => {
@@ -485,7 +493,7 @@ async fn receive_spotify(bot: Bot, msg: Message, state: Arc<BotState>, dialogue:
 async fn receive_playlist_import(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyDialogue) -> ResponseResult<()> {
     dialogue.exit().await.ok();
     if let Some(url) = msg.text() {
-        receive_playlist_link(&bot, &msg, &state, url.trim(), false).await?;
+        receive_playlist_link(&bot, &msg, &state, url.trim(), state.media.is_some()).await?;
     }
     Ok(())
 }
@@ -787,7 +795,13 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
         }
         "📥 Import playlist" => {
             dialogue.update(State::AwaitingPlaylistImport).await.ok();
-            bot.send_message(msg.chat.id, "📥 Send me a Spotify or YouTube playlist link and I'll download every song:").await?;
+            if let Some(server) = &state.media {
+                bot.send_message(msg.chat.id, format!(
+                    "📥 Send me a Spotify or YouTube playlist link — I'll download every song and rebuild the playlist in {}:",
+                    server.label())).await?;
+            } else {
+                bot.send_message(msg.chat.id, "📥 Send me a Spotify or YouTube playlist link and I'll download every song:").await?;
+            }
             return Ok(());
         }
         "🎧 Clone playlist" => {
@@ -849,18 +863,26 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
             return Ok(());
         }
         "📊 Check status" => {
+            let mut t = String::new();
             match deemix::get_queue(&state).await {
                 Ok(q) => {
-                    let mut t = "✅ Deemix is reachable\n".to_string();
+                    t.push_str("✅ Deemix is reachable\n");
                     if q.downloading > 0 { t.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { t.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
                     if q.failed > 0 { t.push_str(&format!("❌ Failed: {}\n", q.failed)); }
-                    if q.done > 0 { t.push_str(&format!("✅ Completed: {}", q.done)); }
-                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { t.push_str("📭 Queue is empty"); }
-                    bot.send_message(msg.chat.id, t).await?;
+                    if q.done > 0 { t.push_str(&format!("✅ Completed: {}\n", q.done)); }
+                    if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { t.push_str("📭 Queue is empty\n"); }
                 }
-                Err(e) => { bot.send_message(msg.chat.id, format!("❌ Can't reach deemix: {}", e)).await?; }
+                Err(e) => { t.push_str(&format!("❌ Can't reach deemix: {}\n", e)); }
             }
+            if let Some(server) = &state.media {
+                t.push('\n');
+                match server.connect(&state.http).await {
+                    Ok(_) => t.push_str(&format!("✅ {} is reachable", server.label())),
+                    Err(e) => t.push_str(&format!("❌ Can't reach {}: {}", server.label(), e)),
+                }
+            }
+            bot.send_message(msg.chat.id, t.trim_end().to_string()).await?;
             return Ok(());
         }
         "🧹 Clear queue" => {
@@ -1587,7 +1609,10 @@ async fn queue_playlist(
         }
     }
 
-    bot.edit_message_text(chat, status_id, text).await?;
+    // Clear the progress spinner and send the result as a new message so it
+    // appears at the bottom of the chat even after a long queuing process.
+    let _ = bot.delete_message(chat, status_id).await;
+    bot.send_message(chat, text).await?;
     Ok(())
 }
 
