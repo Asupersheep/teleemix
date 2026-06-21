@@ -26,9 +26,9 @@ const DOWNLOAD_MAX_POLLS: usize = 240;
 /// Wait for the library scan up to 5 minutes.
 const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const SCAN_MAX_POLLS: usize = 30;
-/// Retry matching unfound tracks a few times while the server indexes.
-const MATCH_ATTEMPTS: usize = 5;
-const MATCH_RETRY_INTERVAL: Duration = Duration::from_secs(20);
+/// Retry matching unfound tracks — up to 6 minutes total to absorb slow indexing.
+const MATCH_ATTEMPTS: usize = 12;
+const MATCH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JobTrack {
@@ -109,7 +109,9 @@ async fn run(bot: Bot, state: Arc<BotState>, job: PlaylistJob) {
         log::info!("[job {}] no downloads to wait for, rebuilding immediately", job.id);
     }
     let mut polls = 0usize;
+    let mut last_pending = tracked;
     let mut last_map = std::collections::HashMap::new();
+    let mut progress_msg: Option<teloxide::types::MessageId> = None;
     while tracked > 0 {
         match deemix::queue_status_map(&state).await {
             Ok(map) => {
@@ -118,6 +120,7 @@ async fn run(bot: Bot, state: Arc<BotState>, job: PlaylistJob) {
                     .filter(|t| matches!(map.get(&t.uuid).map(|s| s.as_str()), Some("inQueue") | Some("downloading")))
                     .count();
                 last_map = map;
+                last_pending = pending;
                 if pending == 0 {
                     break;
                 }
@@ -130,7 +133,22 @@ async fn run(bot: Bot, state: Arc<BotState>, job: PlaylistJob) {
             log::warn!("[job {}] download wait timed out, proceeding with what's done", job.id);
             break;
         }
+        // Every 10 polls (~5 min) send/edit a progress message so the user
+        // knows the job is still running.
+        if polls % 10 == 0 {
+            let text = format!(
+                "⏳ Playlist \"{}\" — {} track(s) still downloading. Next check in 30 s.",
+                job.name, last_pending
+            );
+            match progress_msg {
+                Some(mid) => { let _ = bot.edit_message_text(chat, mid, &text).await; }
+                None => if let Ok(m) = bot.send_message(chat, &text).await { progress_msg = Some(m.id); }
+            }
+        }
         tokio::time::sleep(DOWNLOAD_POLL_INTERVAL).await;
+    }
+    if let Some(mid) = progress_msg {
+        let _ = bot.delete_message(chat, mid).await;
     }
 
     // Tracks whose download failed are excluded from the playlist.
@@ -179,7 +197,10 @@ async fn run(bot: Bot, state: Arc<BotState>, job: PlaylistJob) {
         }
     };
     session.trigger_scan(&state.http).await;
-    tokio::time::sleep(SCAN_POLL_INTERVAL).await;
+    // Always wait at least 60 s before polling scan status — Jellyfin has no
+    // scan-status endpoint so the poll loop exits immediately, and other
+    // servers need time to discover the new files before reporting "scanning".
+    tokio::time::sleep(Duration::from_secs(60)).await;
     let mut scan_polls = 0usize;
     while session.scan_in_progress(&state.http).await && scan_polls < SCAN_MAX_POLLS {
         scan_polls += 1;

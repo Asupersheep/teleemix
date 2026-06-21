@@ -1516,13 +1516,52 @@ async fn queue_playlist(
 ) -> ResponseResult<()> {
     let total = pl.tracks.len();
     let mut queued = 0usize;
+    let mut skipped = 0usize;
     let mut not_found: Vec<String> = Vec::new();
     let mut job_tracks: Vec<jobs::JobTrack> = Vec::new();
 
+    // Connect to the media server upfront so we can skip tracks that are
+    // already in the library (avoids re-downloading them).
+    let server_session = if let Some(server) = &state.media {
+        match server.connect(&state.http).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("[playlist] media server pre-check failed, skipping existence checks: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     for (i, track) in pl.tracks.iter().enumerate() {
         if i % 5 == 0 {
+            let skip_note = if skipped > 0 {
+                format!(" ({} already in {}, skipped)",
+                    skipped,
+                    state.media.as_ref().map(|m| m.label()).unwrap_or("server"))
+            } else {
+                String::new()
+            };
             let _ = bot.edit_message_text(chat, status_id,
-                format!("⏳ Queuing \"{}\" — {}/{} tracks...", pl.name, i, total)).await;
+                format!("⏳ Queuing \"{}\" — {}/{} tracks...{}", pl.name, i, total, skip_note)).await;
+        }
+
+        // Skip tracks already present in the media server.
+        if let Some(session) = &server_session {
+            if session.find_track(&state.http, &track.title, &track.artist).await.is_some() {
+                skipped += 1;
+                if rebuild {
+                    // Include in the rebuild job so the existing track is
+                    // still added to the rebuilt playlist.
+                    job_tracks.push(jobs::JobTrack {
+                        title: track.title.clone(),
+                        artist: track.artist.clone(),
+                        uuid: String::new(),
+                    });
+                }
+                continue;
+            }
         }
 
         let full_query = if track.artist.is_empty() {
@@ -1564,7 +1603,12 @@ async fn queue_playlist(
         }
     }
 
-    let mut text = format!("✅ Playlist \"{}\": queued {}/{} tracks.", pl.name, queued, total);
+    let mut text = format!("✅ Playlist \"{}\": queued {}/{} tracks.", pl.name, queued, total - skipped);
+    if skipped > 0 {
+        text.push_str(&format!("\n⏭ {} already in {} — skipped.",
+            skipped,
+            state.media.as_ref().map(|m| m.label()).unwrap_or("media server")));
+    }
     if !not_found.is_empty() {
         text.push_str("\n\n😕 Couldn't queue these:\n");
         for t in not_found.iter().take(15) {
