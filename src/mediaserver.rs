@@ -75,21 +75,36 @@ impl MediaServer {
             plex_section: String::new(),
             plex_machine: String::new(),
         };
-        if let Self::Plex { url, token } = self {
-            let identity = plex_get(http, url, token, "/identity", &[]).await
-                .ok_or("Plex unreachable (GET /identity failed)")?;
-            session.plex_machine = identity["MediaContainer"]["machineIdentifier"]
-                .as_str()
-                .ok_or("Plex /identity returned no machineIdentifier")?
-                .to_string();
-            let sections = plex_get(http, url, token, "/library/sections", &[]).await
-                .ok_or("Plex GET /library/sections failed")?;
-            session.plex_section = sections["MediaContainer"]["Directory"]
-                .as_array()
-                .and_then(|dirs| dirs.iter().find(|d| d["type"] == "artist"))
-                .and_then(|d| d["key"].as_str())
-                .ok_or("No music library found on the Plex server")?
-                .to_string();
+        match self {
+            Self::Plex { url, token } => {
+                let identity = plex_get(http, url, token, "/identity", &[]).await
+                    .ok_or("Plex unreachable (GET /identity failed)")?;
+                session.plex_machine = identity["MediaContainer"]["machineIdentifier"]
+                    .as_str()
+                    .ok_or("Plex /identity returned no machineIdentifier")?
+                    .to_string();
+                let sections = plex_get(http, url, token, "/library/sections", &[]).await
+                    .ok_or("Plex GET /library/sections failed")?;
+                session.plex_section = sections["MediaContainer"]["Directory"]
+                    .as_array()
+                    .and_then(|dirs| dirs.iter().find(|d| d["type"] == "artist"))
+                    .and_then(|d| d["key"].as_str())
+                    .ok_or("No music library found on the Plex server")?
+                    .to_string();
+            }
+            Self::Jellyfin { url, api_key, .. } => {
+                let resp = http.get(format!("{}/System/Info", url))
+                    .header("X-Emby-Token", api_key)
+                    .send().await
+                    .map_err(|e| format!("Jellyfin unreachable: {}", e))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Jellyfin unreachable ({})", resp.status()));
+                }
+            }
+            Self::Navidrome { url, user, password } => {
+                sub_get(http, url, user, password, "ping", &[]).await
+                    .ok_or_else(|| "Navidrome unreachable or credentials invalid".to_string())?;
+            }
         }
         Ok(session)
     }

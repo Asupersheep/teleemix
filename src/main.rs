@@ -493,7 +493,7 @@ async fn receive_spotify(bot: Bot, msg: Message, state: Arc<BotState>, dialogue:
 async fn receive_playlist_import(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: MyDialogue) -> ResponseResult<()> {
     dialogue.exit().await.ok();
     if let Some(url) = msg.text() {
-        receive_playlist_link(&bot, &msg, &state, url.trim(), state.media.is_some()).await?;
+        receive_playlist_link(&bot, &msg, &state, url.trim(), false).await?;
     }
     Ok(())
 }
@@ -795,13 +795,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
         }
         "📥 Import playlist" => {
             dialogue.update(State::AwaitingPlaylistImport).await.ok();
-            if let Some(server) = &state.media {
-                bot.send_message(msg.chat.id, format!(
-                    "📥 Send me a Spotify or YouTube playlist link — I'll download every song and rebuild the playlist in {}:",
-                    server.label())).await?;
-            } else {
-                bot.send_message(msg.chat.id, "📥 Send me a Spotify or YouTube playlist link and I'll download every song:").await?;
-            }
+            bot.send_message(msg.chat.id, "📥 Send me a Spotify or YouTube playlist link and I'll download every song:").await?;
             return Ok(());
         }
         "🎧 Clone playlist" => {
