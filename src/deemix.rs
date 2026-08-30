@@ -4,14 +4,70 @@ use serde_json::Value;
 
 use crate::BotState;
 
-pub async fn login(state: &Arc<BotState>) {
+/// User-facing message shown whenever a download can't be queued because deemix
+/// can't authenticate with Deezer. By far the most common cause is an expired
+/// ARL, so the message points straight at the fix.
+pub const ARL_EXPIRED_MSG: &str = "⚠️ deemix couldn't log in to Deezer — the ARL has most likely expired.\n\nSend /updatearl with a fresh ARL to get downloads working again.";
+
+/// True when `err` is one of our auth messages, so callers can show it on its
+/// own instead of behind a generic "Failed to queue:" prefix.
+pub fn is_auth_error(err: &str) -> bool {
+    err == ARL_EXPIRED_MSG
+}
+
+/// Format an `add_to_queue` error for a Telegram reply: auth failures are shown
+/// as-is (they already carry the /updatearl instruction), anything else gets
+/// the usual prefix.
+pub fn queue_fail_text(err: &str) -> String {
+    if is_auth_error(err) {
+        err.to_string()
+    } else {
+        format!("❌ Failed to queue: {err}")
+    }
+}
+
+pub async fn login(state: &Arc<BotState>) -> Result<String, String> {
     if state.config.deemix_arl.is_empty() {
         log::warn!("DEEMIX_ARL not set — bot may get NotLoggedIn errors.");
-        return;
+        return Err("DEEMIX_ARL is not set".to_string());
     }
     match login_arl(state, &state.config.deemix_arl.clone()).await {
-        Ok(_) => log::info!("Successfully logged into deemix"),
-        Err(e) => log::warn!("Could not login to deemix: {}", e),
+        Ok(name) => {
+            log::info!("Successfully logged into deemix as {}", name);
+            Ok(name)
+        }
+        Err(e) => {
+            log::warn!("Could not login to deemix: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Drop deemix's current Deezer session. Needed before validating a *new* ARL:
+/// deemix's `loginArl` route short-circuits to "already logged in" (status 2)
+/// without testing the ARL when a session is still active, so `/updatearl`
+/// would otherwise accept a dud ARL.
+pub async fn logout(state: &Arc<BotState>) {
+    let url = format!("{}/api/logout", state.config.deemix_url);
+    if let Err(e) = state.http.post(&url).send().await {
+        log::warn!("deemix logout request failed (continuing anyway): {}", e);
+    }
+}
+
+/// Validate an ARL against deemix, forcing a real login check. On failure, the
+/// previous ARL is re-applied so a bad `/updatearl` attempt doesn't leave
+/// deemix logged out.
+pub async fn login_arl_fresh(state: &Arc<BotState>, arl: &str) -> Result<String, String> {
+    logout(state).await;
+    match login_arl(state, arl).await {
+        Ok(name) => Ok(name),
+        Err(e) => {
+            let prev = state.current_arl.lock().await.clone();
+            if !prev.is_empty() && prev != arl {
+                let _ = login_arl(state, &prev).await;
+            }
+            Err(e)
+        }
     }
 }
 
@@ -27,16 +83,29 @@ pub async fn login_arl(state: &Arc<BotState>, arl: &str) -> Result<String, Strin
 
     let data: Value = resp.json().await.map_err(|e| e.to_string())?;
 
-    // status 1 = logged in, status 2 = already logged in
+    // deemix login status codes (webui loginArl route):
+    //   -1 NOT_AVAILABLE   Deezer unreachable / geo-blocked
+    //    0 FAILED          Deezer rejected the ARL (expired) or it was malformed
+    //    1 SUCCESS
+    //    2 ALREADY_LOGGED
+    //    3 FORCED_SUCCESS  single-user credential restore
     let status = data["status"].as_i64().unwrap_or(0);
-    if status == 1 || status == 2 {
-        let username = data["user"]["name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-        Ok(username)
-    } else {
-        Err(format!("Login failed (status {})", status))
+    match status {
+        1 | 2 | 3 => {
+            let username = data["user"]["name"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            Ok(username)
+        }
+        -1 => Err("Deezer is unavailable right now (deemix couldn't reach it). Try again shortly.".to_string()),
+        _ => {
+            if data["error"].as_str() == Some("invalidArl") {
+                Err("the ARL is malformed — it must be the plain hex token, with no quotes, spaces or newlines".to_string())
+            } else {
+                Err("Deezer rejected the ARL — it has most likely expired".to_string())
+            }
+        }
     }
 }
 
@@ -57,8 +126,17 @@ async fn relogin(state: &Arc<BotState>) -> Result<(), String> {
 pub async fn add_to_queue(state: &Arc<BotState>, url: &str) -> Result<Vec<String>, String> {
     match add_to_queue_once(state, url).await {
         Err(e) if e.eq_ignore_ascii_case("notloggedin") => {
-            relogin(state).await?;
-            add_to_queue_once(state, url).await
+            // Session expired — try a single re-login and retry. If the
+            // re-login itself fails, or the retry is still NotLoggedIn, the
+            // ARL is almost certainly expired: surface the actionable message.
+            if let Err(login_err) = relogin(state).await {
+                log::warn!("deemix re-login failed: {}", login_err);
+                return Err(ARL_EXPIRED_MSG.to_string());
+            }
+            match add_to_queue_once(state, url).await {
+                Err(e) if e.eq_ignore_ascii_case("notloggedin") => Err(ARL_EXPIRED_MSG.to_string()),
+                other => other,
+            }
         }
         other => other,
     }

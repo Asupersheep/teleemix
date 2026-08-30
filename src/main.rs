@@ -202,18 +202,25 @@ async fn main() {
     let token = env::var("TELEGRAM_TOKEN").expect("TELEGRAM_TOKEN must be set");
     let bot = Bot::new(token);
 
-    deemix::login(&state).await;
+    let login_failed = deemix::login(&state).await.err();
 
     log::info!("Teleemix bot starting...");
 
     // Resume playlist rebuild jobs that were pending before the last restart
     jobs::resume_all(&bot, &state);
 
-    // Send startup notification to users with restart_notifications enabled
+    // Send startup notification to users with restart_notifications enabled.
+    // If the deemix login failed on boot, warn them so they can /updatearl
+    // before hitting a failed download.
     {
-        let startup_msg = "🎵 Teleemix is back online!\n\nTap /menu for quick actions.";
+        let startup_msg = match &login_failed {
+            None => "🎵 Teleemix is back online!\n\nTap /menu for quick actions.".to_string(),
+            Some(reason) => format!(
+                "🎵 Teleemix is back online — but it couldn't log in to deemix:\n\n⚠️ {reason}.\n\nDownloads will fail until this is fixed. Send /updatearl with a fresh ARL."
+            ),
+        };
         for chat_id in users::all_with_notifications(&state.users) {
-            let _ = bot.send_message(teloxide::types::ChatId(chat_id), startup_msg).await;
+            let _ = bot.send_message(teloxide::types::ChatId(chat_id), startup_msg.clone()).await;
         }
     }
 
@@ -614,7 +621,7 @@ async fn receive_voice_recognize(bot: Bot, msg: Message, state: Arc<BotState>, d
                     Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
                     Err(e) => {
                         log::info!("[recognize] Step 1 FAILED: add_to_queue error: {}", e);
-                        bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?;
+                        bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?;
                     }
                 }
             } else {
@@ -634,7 +641,7 @@ async fn receive_voice_recognize(bot: Bot, msg: Message, state: Arc<BotState>, d
                         Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
                         Err(e) => {
                             log::info!("[recognize] Step 2 FAILED: add_to_queue error: {}", e);
-                            bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?;
+                            bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?;
                         }
                     }
                 } else {
@@ -644,7 +651,7 @@ async fn receive_voice_recognize(bot: Bot, msg: Message, state: Arc<BotState>, d
                         log::info!("[recognize] Step 2b: using iTunes→Odesli Deezer URL: {}", deezer_url);
                         match deemix::add_to_queue(&state, deezer_url).await {
                             Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
-                            Err(e) => { log::info!("[recognize] Step 2b FAILED: {}", e); bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?; }
+                            Err(e) => { log::info!("[recognize] Step 2b FAILED: {}", e); bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?; }
                         }
                     } else {
                     // Step 2c: try Odesli API directly with Spotify URL
@@ -659,7 +666,7 @@ async fn receive_voice_recognize(bot: Bot, msg: Message, state: Arc<BotState>, d
                         log::info!("[recognize] Step 2c: using Spotify→Odesli Deezer URL: {}", deezer_url);
                         match deemix::add_to_queue(&state, deezer_url).await {
                             Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
-                            Err(e) => { log::info!("[recognize] Step 2c FAILED: {}", e); bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?; }
+                            Err(e) => { log::info!("[recognize] Step 2c FAILED: {}", e); bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?; }
                         }
                     } else {
                     // Try Spotify metadata for proper Unicode title; fall back to arabizi
@@ -1104,7 +1111,7 @@ async fn handle_callback(
             bot.edit_message_text(msg.chat.id, msg.id, format!("⏳ Queuing {}...", kind.to_lowercase())).await?;
             match deemix::add_to_queue(&state, url).await {
                 Ok(_) => { bot.edit_message_text(msg.chat.id, msg.id, format!("✅ {} added to queue!", kind)).await?; }
-                Err(e) => { bot.edit_message_text(msg.chat.id, msg.id, format!("❌ Failed: {}", e)).await?; }
+                Err(e) => { bot.edit_message_text(msg.chat.id, msg.id, deemix::queue_fail_text(&e)).await?; }
             }
         }
     }
@@ -1183,7 +1190,7 @@ async fn handle_callback(
                                     Ok(_) => { bot.edit_message_text(msg.chat.id, msg.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
                                     Err(e) => {
                                         log::info!("[recognize/cb] Step 1 FAILED: add_to_queue error: {}", e);
-                                        bot.edit_message_text(msg.chat.id, msg.id, format!("❌ Failed to queue: {}", e)).await?;
+                                        bot.edit_message_text(msg.chat.id, msg.id, deemix::queue_fail_text(&e)).await?;
                                     }
                                 }
                             } else {
@@ -1203,7 +1210,7 @@ async fn handle_callback(
                                         Ok(_) => { bot.edit_message_text(msg.chat.id, msg.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
                                         Err(e) => {
                                             log::info!("[recognize/cb] Step 2 FAILED: add_to_queue error: {}", e);
-                                            bot.edit_message_text(msg.chat.id, msg.id, format!("❌ Failed to queue: {}", e)).await?;
+                                            bot.edit_message_text(msg.chat.id, msg.id, deemix::queue_fail_text(&e)).await?;
                                         }
                                     }
                                 } else {
@@ -1213,7 +1220,7 @@ async fn handle_callback(
                                         log::info!("[recognize/cb] Step 2b: using iTunes→Odesli Deezer URL: {}", deezer_url);
                                         match deemix::add_to_queue(&state, deezer_url).await {
                                             Ok(_) => { bot.edit_message_text(msg.chat.id, msg.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
-                                            Err(e) => { log::info!("[recognize/cb] Step 2b FAILED: {}", e); bot.edit_message_text(msg.chat.id, msg.id, format!("❌ Failed to queue: {}", e)).await?; }
+                                            Err(e) => { log::info!("[recognize/cb] Step 2b FAILED: {}", e); bot.edit_message_text(msg.chat.id, msg.id, deemix::queue_fail_text(&e)).await?; }
                                         }
                                     } else {
                                     // Step 2c: try Odesli API directly with Spotify URL
@@ -1228,7 +1235,7 @@ async fn handle_callback(
                                         log::info!("[recognize/cb] Step 2c: using Spotify→Odesli Deezer URL: {}", deezer_url);
                                         match deemix::add_to_queue(&state, deezer_url).await {
                                             Ok(_) => { bot.edit_message_text(msg.chat.id, msg.id, format!("✅ {} — {} added to queue!", rec.title, rec.artist)).await?; }
-                                            Err(e) => { log::info!("[recognize/cb] Step 2c FAILED: {}", e); bot.edit_message_text(msg.chat.id, msg.id, format!("❌ Failed to queue: {}", e)).await?; }
+                                            Err(e) => { log::info!("[recognize/cb] Step 2c FAILED: {}", e); bot.edit_message_text(msg.chat.id, msg.id, deemix::queue_fail_text(&e)).await?; }
                                         }
                                     } else {
                                     // Try Spotify metadata for proper Unicode title; fall back to arabizi
@@ -1315,7 +1322,7 @@ async fn queue_url(bot: &Bot, msg: &Message, state: &Arc<BotState>, url: &str) -
 
     match deemix::add_to_queue(state, url).await {
         Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} added to queue!", capitalize(kind))).await?; }
-        Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?; }
+        Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?; }
     }
     Ok(())
 }
@@ -1370,7 +1377,7 @@ async fn handle_streaming_link(bot: &Bot, msg: &Message, state: &Arc<BotState>, 
                             Some(deezer_url) => {
                                 match deemix::add_to_queue(state, &deezer_url).await {
                                     Ok(_) => { bot.edit_message_text(msg.chat.id, sent.id, format!("✅ {} added to queue!", meta.label)).await?; }
-                                    Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, format!("❌ Failed to queue: {}", e)).await?; }
+                                    Err(e) => { bot.edit_message_text(msg.chat.id, sent.id, deemix::queue_fail_text(&e)).await?; }
                                 }
                             }
                             None => { bot.edit_message_text(msg.chat.id, sent.id, format!("😕 No results found on Deezer for: {}", meta.query)).await?; }
@@ -1489,7 +1496,7 @@ async fn queue_single_via_odesli(
         Some(deezer_url) => {
             match deemix::add_to_queue(state, &deezer_url).await {
                 Ok(_) => { bot.edit_message_text(chat, status_id, format!("✅ {} added to queue!", capitalize(&service))).await?; }
-                Err(e) => { bot.edit_message_text(chat, status_id, format!("❌ Failed to queue: {}", e)).await?; }
+                Err(e) => { bot.edit_message_text(chat, status_id, deemix::queue_fail_text(&e)).await?; }
             }
         }
         None => {
@@ -1519,6 +1526,7 @@ async fn queue_playlist(
     let mut skipped = 0usize;
     let mut not_found: Vec<String> = Vec::new();
     let mut job_tracks: Vec<jobs::JobTrack> = Vec::new();
+    let mut auth_failed = false;
 
     // Connect to the media server upfront so we can skip tracks that are
     // already in the library (avoids re-downloading them).
@@ -1596,11 +1604,23 @@ async fn queue_playlist(
                 }
                 Err(e) => {
                     log::warn!("[playlist] failed to queue {:?}: {}", label, e);
+                    if deemix::is_auth_error(&e) {
+                        // ARL expired — every remaining track would fail the
+                        // same way. Stop and tell the user how to fix it.
+                        auth_failed = true;
+                        break;
+                    }
                     not_found.push(label);
                 }
             },
             None => not_found.push(label),
         }
+    }
+
+    if auth_failed {
+        let _ = bot.delete_message(chat, status_id).await;
+        bot.send_message(chat, deemix::ARL_EXPIRED_MSG).await?;
+        return Ok(());
     }
 
     let mut text = format!("✅ Playlist \"{}\": queued {}/{} tracks.", pl.name, queued, total - skipped);
@@ -1657,7 +1677,9 @@ async fn queue_playlist(
 async fn handle_updatearl(bot: &Bot, msg: &Message, state: &Arc<BotState>, arl: &str) -> ResponseResult<()> {
     let sent = bot.send_message(msg.chat.id, "🔄 Validating new ARL...").await?;
 
-    match deemix::login_arl(state, arl).await {
+    // Force a real login check — deemix reports "already logged in" without
+    // testing the ARL if the previous session is still active.
+    match deemix::login_arl_fresh(state, arl).await {
         Ok(_username) => {
             *state.current_arl.lock().await = arl.to_string();
             bot.edit_message_text(msg.chat.id, sent.id, format!("✅ Logged in!\n🔄 Updating .env file...")).await?;
