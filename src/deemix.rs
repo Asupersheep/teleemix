@@ -109,6 +109,21 @@ pub async fn login_arl(state: &Arc<BotState>, arl: &str) -> Result<String, Strin
     }
 }
 
+/// A `/status` line reporting whether deemix can authenticate with Deezer using
+/// the current ARL. Safe to call anytime: if the session is already alive
+/// deemix just replies "already logged in"; otherwise this performs the same
+/// login the next download would trigger.
+pub async fn login_status_line(state: &Arc<BotState>) -> String {
+    let arl = state.current_arl.lock().await.clone();
+    if arl.is_empty() {
+        return "❌ Deezer: no ARL configured — set DEEMIX_ARL or run /updatearl".to_string();
+    }
+    match login_arl(state, &arl).await {
+        Ok(name) => format!("✅ Deezer: logged in as {name}"),
+        Err(e) => format!("❌ Deezer login failed: {e}\n   If this persists, run /updatearl with a fresh ARL."),
+    }
+}
+
 /// deemix sessions live in an in-memory store with a ~24h TTL, so the bot's
 /// cookie session silently expires and POSTs start failing with NotLoggedIn.
 /// Re-login with the current ARL so the caller can retry.

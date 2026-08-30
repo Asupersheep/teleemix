@@ -395,8 +395,10 @@ Both are in /menu; pasting a playlist link directly also offers the choice.\n\n\
 
         Command::Status => {
             let mut text = String::new();
+            let mut deemix_reachable = false;
             match deemix::get_queue(&state).await {
                 Ok(q) => {
+                    deemix_reachable = true;
                     text.push_str("✅ Deemix is reachable\n");
                     if q.downloading > 0 { text.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { text.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
@@ -405,6 +407,10 @@ Both are in /menu; pasting a playlist link directly also offers the choice.\n\n\
                     if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { text.push_str("📭 Queue is empty\n"); }
                 }
                 Err(e) => { text.push_str(&format!("❌ Can't reach deemix: {}\n", e)); }
+            }
+            if deemix_reachable {
+                text.push_str(&deemix::login_status_line(&state).await);
+                text.push('\n');
             }
             if let Some(server) = &state.media {
                 text.push('\n');
@@ -865,8 +871,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
         }
         "📊 Check status" => {
             let mut t = String::new();
+            let mut deemix_reachable = false;
             match deemix::get_queue(&state).await {
                 Ok(q) => {
+                    deemix_reachable = true;
                     t.push_str("✅ Deemix is reachable\n");
                     if q.downloading > 0 { t.push_str(&format!("⬇️ Downloading: {}\n", q.downloading)); }
                     if q.pending > 0 { t.push_str(&format!("⏳ Pending: {}\n", q.pending)); }
@@ -875,6 +883,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>, dialogue: 
                     if q.downloading == 0 && q.pending == 0 && q.done == 0 && q.failed == 0 { t.push_str("📭 Queue is empty\n"); }
                 }
                 Err(e) => { t.push_str(&format!("❌ Can't reach deemix: {}\n", e)); }
+            }
+            if deemix_reachable {
+                t.push_str(&deemix::login_status_line(&state).await);
+                t.push('\n');
             }
             if let Some(server) = &state.media {
                 t.push('\n');

@@ -75,6 +75,8 @@ All states return to `Idle` after handling. Voice notes received in `Idle` show 
 
 `login_arl` status codes (bambanah/deemix `loginArl` route): `1` success, `2` already-logged-in, `3` forced-success (all treated as OK); `-1` Deezer unavailable; `0` failed — `{error:"invalidArl"}` means malformed, otherwise expired. The route returns `2` **without testing the ARL** when a session is already active, so `/updatearl` calls `login_arl_fresh` which hits `/api/logout` first (and restores the previous ARL if the new one fails, so a dud attempt doesn't leave deemix logged out).
 
+`/status` calls `deemix::login_status_line` (only when deemix itself is reachable) — it logs in with `current_arl` and reports "✅ Deezer: logged in as {name}" or the failure reason + a /updatearl nudge. Harmless to call repeatedly: a live session just returns status 2.
+
 **No Spotify API** — Spotify links are resolved by scraping `open.spotify.com/embed/track/ID?utm_source=oembed` for `__NEXT_DATA__` JSON. Falls back to oEmbed for title-only. Single YouTube, YouTube Music, and Apple Music links are resolved via the Odesli API (song.link) to get a Deezer URL and queued directly.
 
 **Playlist scanning** — Spotify playlists are scanned from the embed page `trackList` (works for user-generated playlists; ~first 100 tracks). YouTube playlists are scanned from the playlist page's `ytInitialData` JSON (~first 100 videos; auto-generated mixes `list=RD...` can't be scanned). Each track is searched on Deezer and the first match queued individually, with a progress/summary message. Queue-removal endpoints: `removeFromQueue` takes `uuid` as a **query param** (not JSON body); `removeFinishedDownloads` clears `status == "completed"` items.
